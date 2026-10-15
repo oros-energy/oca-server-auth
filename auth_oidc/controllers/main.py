@@ -4,12 +4,17 @@
 
 import base64
 import hashlib
+import json
 import logging
 import secrets
 
 from werkzeug.urls import url_decode, url_encode
 
+from odoo.http import request
+
 from odoo.addons.auth_oauth.controllers.main import OAuthLogin
+
+from ..models.res_users import remember_nonce
 
 _logger = logging.getLogger(__name__)
 
@@ -21,8 +26,14 @@ class OpenIDLogin(OAuthLogin):
             flow = provider.get("flow")
             if flow in ("id_token", "id_token_code"):
                 params = url_decode(provider["auth_link"].split("?")[-1])
-                # nonce
-                params["nonce"] = secrets.token_urlsafe()
+                # nonce, also passed in the state and remembered in the session
+                # so that auth_oauth can check it against the id_token
+                nonce = secrets.token_urlsafe()
+                params["nonce"] = nonce
+                state = json.loads(params.get("state") or "{}")
+                state["n"] = nonce
+                params["state"] = json.dumps(state)
+                remember_nonce(request.session, nonce)
                 # response_type
                 if flow == "id_token":
                     # https://openid.net/specs/openid-connect-core-1_0.html

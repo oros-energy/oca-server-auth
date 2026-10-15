@@ -2,6 +2,9 @@
 # Copyright 2021 ACSONE SA/NV <https://acsone.eu>
 # License: AGPL-3.0 or later (http://www.gnu.org/licenses/agpl)
 
+import hashlib
+import hmac
+import json
 import logging
 
 import requests
@@ -11,6 +14,21 @@ from odoo.exceptions import AccessDenied
 from odoo.http import request
 
 _logger = logging.getLogger(__name__)
+
+# digests of the nonces issued in the login links of the session
+SESSION_NONCES_KEY = "auth_oidc_nonces"
+SESSION_NONCES_MAX = 10
+
+
+def nonce_digest(nonce):
+    return hashlib.sha256(str(nonce).encode()).hexdigest()
+
+
+def remember_nonce(session, nonce):
+    """Remember a nonce issued in a login link of ``session``."""
+    digests = list(session.get(SESSION_NONCES_KEY) or [])
+    digests.append(nonce_digest(nonce))
+    session[SESSION_NONCES_KEY] = digests[-SESSION_NONCES_MAX:]
 
 
 class ResUsers(models.Model):
@@ -45,6 +63,32 @@ class ResUsers(models.Model):
         return response_json.get("access_token"), response_json.get("id_token")
 
     @api.model
+    def _auth_oidc_check_nonce(self, nonce, params):
+        """Check that the id_token nonce is the one of the login state and was
+        issued for the current session, then consume it. This rejects an
+        id_token obtained for another login."""
+        try:
+            state = json.loads(params.get("state") or "{}")
+        except (TypeError, ValueError):
+            state = {}
+        expected = state.get("n") if isinstance(state, dict) else None
+        if (
+            not nonce
+            or not expected
+            or not hmac.compare_digest(str(nonce), str(expected))
+        ):
+            _logger.error("id_token nonce does not match the login state.")
+            raise AccessDenied()
+        session = request.session if request else None
+        digests = list((session or {}).get(SESSION_NONCES_KEY) or [])
+        digest = nonce_digest(nonce)
+        if digest not in digests:
+            _logger.error("id_token nonce was not issued for this session.")
+            raise AccessDenied()
+        digests.remove(digest)
+        session[SESSION_NONCES_KEY] = digests
+
+    @api.model
     def auth_oauth(self, provider, params):
         oauth_provider = self.env["auth.oauth.provider"].browse(provider)
         if oauth_provider.flow == "id_token":
@@ -73,6 +117,7 @@ class ResUsers(models.Model):
         elif not validation.get("user_id"):
             _logger.error("user_id claim not found in id_token (after mapping).")
             raise AccessDenied()
+        self._auth_oidc_check_nonce(validation.get("nonce"), params)
         # retrieve and sign in user
         params["access_token"] = access_token
         login = self._auth_oauth_signin(provider, validation, params)
