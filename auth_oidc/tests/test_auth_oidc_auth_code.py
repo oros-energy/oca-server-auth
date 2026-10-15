@@ -20,6 +20,7 @@ from odoo.tests import common
 from odoo.addons.http_routing.tests.common import MockRequest as _MockRequest
 
 from ..controllers.main import OpenIDLogin
+from ..models.res_users import SESSION_NONCES_KEY, nonce_digest, remember_nonce
 
 BASE_URL = f"http://localhost:{odoo.tools.config['http_port']}"
 
@@ -33,6 +34,17 @@ def MockRequest(env):
 
 
 class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
+    # the id_token must carry the nonce of the state, issued in the session
+    NONCE = "auth-oidc-test-nonce"
+    STATE = json.dumps({"n": NONCE})
+
+    @contextlib.contextmanager
+    def _login_request(self, nonce=NONCE):
+        with MockRequest(self.env) as request:
+            if nonce:
+                remember_nonce(request.session, nonce)
+            yield request
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -92,7 +104,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         self.env["auth.oauth.provider"].search(
             [("client_id", "!=", "auth_oidc-test")]
         ).write({"enabled": False})
-        with MockRequest(self.env):
+        with MockRequest(self.env) as request:
             providers = OpenIDLogin().list_providers()
             self.assertEqual(len(providers), 1)
             auth_link = providers[0]["auth_link"]
@@ -105,6 +117,12 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             self.assertEqual(params["code_challenge_method"], ["S256"])
             self.assertTrue(params["nonce"])
             self.assertTrue(params["state"])
+            state = json.loads(params["state"][0])
+            self.assertEqual(state["n"], params["nonce"][0])
+            self.assertIn(
+                nonce_digest(params["nonce"][0]),
+                request.session[SESSION_NONCES_KEY],
+            )
             self.assertEqual(params["redirect_uri"], [BASE_URL + "/auth_oauth/signin"])
 
     def _prepare_login_test_user(self):
@@ -118,10 +136,17 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         return user
 
     def _prepare_login_test_responses(
-        self, access_token="42", id_token_body=None, id_token_headers=None, keys=None
+        self,
+        access_token="42",
+        id_token_body=None,
+        id_token_headers=None,
+        keys=None,
+        nonce=NONCE,
     ):
         if id_token_body is None:
             id_token_body = {}
+        if nonce:
+            id_token_body = {**id_token_body, "nonce": nonce}
         if id_token_headers is None:
             id_token_headers = {"kid": "the_key_id"}
         responses.add(
@@ -154,8 +179,8 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         user = self._prepare_login_test_user()
         self._prepare_login_test_responses(id_token_body={"user_id": user.login})
 
-        params = {"state": json.dumps({})}
-        with MockRequest(self.env):
+        params = {"state": self.STATE}
+        with self._login_request():
             _db, login, token = self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
                 params,
@@ -173,8 +198,8 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             access_token=chr(42),
         )
 
-        params = {"state": json.dumps({})}
-        with MockRequest(self.env):
+        params = {"state": self.STATE}
+        with self._login_request():
             _db, login, token = self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
                 params,
@@ -191,8 +216,8 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             id_token_body={"sub": user.login}, access_token="1764"
         )
 
-        params = {"state": json.dumps({})}
-        with MockRequest(self.env):
+        params = {"state": self.STATE}
+        with self._login_request():
             _db, login, token = self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
                 params,
@@ -223,11 +248,11 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
                 msg="OpenID Connect requires kid to be set if there is"
                 " more than one key in the JWKS",
             ),
-            MockRequest(self.env),
+            self._login_request(),
         ):
             self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
-                {"state": json.dumps({})},
+                {"state": self.STATE},
             )
 
     @responses.activate
@@ -241,10 +266,10 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             keys=[{"kid": "other_key_id", "keys": [self.second_key_public_pem]}],
         )
 
-        with self.assertRaises(JWTError), MockRequest(self.env):
+        with self.assertRaises(JWTError), self._login_request():
             self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
-                {"state": json.dumps({})},
+                {"state": self.STATE},
             )
 
     @responses.activate
@@ -260,12 +285,12 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
 
         with (
             self.assertRaises(AccessDenied),
-            MockRequest(self.env),
+            self._login_request(),
             self.assertLogs(level=logging.ERROR) as logs,
         ):
             self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
-                {"state": json.dumps({})},
+                {"state": self.STATE},
             )
         self.assertEqual(len(logs.records), 1)
         self.assertEqual(logs.records[0].levelno, logging.ERROR)
@@ -288,10 +313,10 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             ],
         )
 
-        with MockRequest(self.env):
+        with self._login_request():
             _db, login, token = self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
-                {"state": json.dumps({})},
+                {"state": self.STATE},
             )
         self.assertEqual(token, "2*3*7")
         self.assertEqual(login, user.login)
@@ -309,10 +334,10 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             ],
         )
 
-        with MockRequest(self.env):
+        with self._login_request():
             _db, login, token = self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
-                {"state": json.dumps({})},
+                {"state": self.STATE},
             )
         self.assertEqual(token, "84/2")
         self.assertEqual(login, user.login)
@@ -328,10 +353,60 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             access_token="122/3",
         )
 
-        with MockRequest(self.env):
+        with self._login_request():
             _db, login, token = self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
-                {"state": json.dumps({})},
+                {"state": self.STATE},
             )
         self.assertEqual(token, "122/3")
         self.assertEqual(login, user.login)
+
+    def _login_denied(self, params, nonce=NONCE):
+        with (
+            self.assertRaises(AccessDenied),
+            self._login_request(nonce=nonce),
+            self.assertLogs(level=logging.ERROR),
+        ):
+            self.env["res.users"].auth_oauth(self.provider_rec.id, params)
+
+    @responses.activate
+    def test_login_without_nonce_in_id_token(self):
+        user = self._prepare_login_test_user()
+        self._prepare_login_test_responses(
+            id_token_body={"user_id": user.login}, nonce=None
+        )
+        self._login_denied({"state": self.STATE})
+
+    @responses.activate
+    def test_login_with_nonce_not_matching_state(self):
+        user = self._prepare_login_test_user()
+        self._prepare_login_test_responses(id_token_body={"user_id": user.login})
+        self._login_denied({"state": json.dumps({"n": "other-nonce"})})
+        self._login_denied({"state": json.dumps({})})
+
+    @responses.activate
+    def test_login_with_nonce_of_other_session(self):
+        user = self._prepare_login_test_user()
+        self._prepare_login_test_responses(id_token_body={"user_id": user.login})
+        # state and id_token agree, but the nonce was not issued here
+        self._login_denied({"state": self.STATE}, nonce=None)
+
+    @responses.activate
+    def test_login_nonce_is_single_use(self):
+        user = self._prepare_login_test_user()
+        self._prepare_login_test_responses(id_token_body={"user_id": user.login})
+        with self._login_request() as request:
+            _db, login, _token = self.env["res.users"].auth_oauth(
+                self.provider_rec.id, {"state": self.STATE}
+            )
+            self.assertEqual(login, user.login)
+            self.assertNotIn(
+                nonce_digest(self.NONCE), request.session[SESSION_NONCES_KEY]
+            )
+            with (
+                self.assertRaises(AccessDenied),
+                self.assertLogs(level=logging.ERROR),
+            ):
+                self.env["res.users"].auth_oauth(
+                    self.provider_rec.id, {"state": self.STATE}
+                )
