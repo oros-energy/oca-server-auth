@@ -155,3 +155,22 @@ class TestMultiToken(TransactionCase):
         )
         with self.assertRaises(exceptions.AccessError):
             self.user.with_user(user_new).action_oauth_clear_token()
+
+    @users("johndoe")
+    def test_check_credentials_requires_oauth_token_type(self):
+        """A multi token is only accepted as an OAuth token credential."""
+        validation = {"user_id": "oauth_uid_johndoe"}
+        params = self._fake_params()
+        self.env["res.users"].sudo()._auth_oauth_signin(
+            self.provider_google.id, validation, params
+        )
+        token = params["access_token_multi"]
+        credential = {"type": "oauth_token", "password": "", "token": token}
+        self.env["res.users"]._check_credentials(credential, {"interactive": True})
+        for other in (
+            {"type": "password", "password": token, "token": token},
+            {"type": "unknown", "token": token},
+            {"type": "oauth_token", "password": "", "token": ""},
+        ):
+            with self.assertRaises(exceptions.AccessDenied):
+                self.env["res.users"]._check_credentials(other, {"interactive": True})

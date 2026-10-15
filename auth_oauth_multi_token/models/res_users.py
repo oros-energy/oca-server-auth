@@ -84,10 +84,15 @@ class ResUsers(models.Model):
         try:
             return super()._check_credentials(credential, env)
         except exceptions.AccessDenied:
+            # only accept OAuth token credentials, like auth_oauth does
+            if not (
+                credential.get("type") == "oauth_token" and credential.get("token")
+            ):
+                raise
             passwd_allowed = (
                 env["interactive"] or not self.env.user._rpc_api_keys_only()
             )
-            if passwd_allowed and self.env.user.active and "token" in credential:
+            if passwd_allowed and self.env.user.active:
                 res = self.multi_token_model.sudo().search(
                     [
                         ("user_id", "=", self.env.uid),
