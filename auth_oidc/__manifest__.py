@@ -12,7 +12,7 @@
     "maintainers": ["sbidoul"],
     "website": "https://github.com/OCA/server-auth",
     "summary": "Allow users to login through OpenID Connect Provider",
-    "external_dependencies": {"python": ["python-jose"]},
+    "external_dependencies": {"python": ["python-jose>=3.4.0"]},
     "depends": ["auth_oauth"],
     "data": ["views/auth_oauth_provider.xml", "data/auth_oauth_data.xml"],
     "demo": ["demo/local_keycloak.xml"],

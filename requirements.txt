@@ -1,2 +1,2 @@
 # generated from manifests external_dependencies
-python-jose
+python-jose>=3.4.0
