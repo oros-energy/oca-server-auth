@@ -1,2 +1,4 @@
 # generated from manifests external_dependencies
+cryptography
+pyjwt
 python-jose>=3.4.0
