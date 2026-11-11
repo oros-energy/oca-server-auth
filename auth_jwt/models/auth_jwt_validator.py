@@ -297,7 +297,7 @@ class AuthJwtValidator(models.Model):
         return super().unlink()
 
     def _get_jwt_cookie_secret(self):
-        secret = self.env["ir.config_parameter"].sudo().get_param("database.secret")
+        secret = self.env["ir.config_parameter"].sudo().get_str("database.secret")
         if not secret:
             _logger.error("database.secret system parameter is not set.")
             raise ConfigurationError()

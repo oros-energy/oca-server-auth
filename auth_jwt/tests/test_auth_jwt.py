@@ -458,3 +458,8 @@ class TestAuthMethod(TransactionCase):
             with self._mock_request(authorization=authorization) as request:
                 self.env["ir.http"]._auth_method_public_or_jwt_validator()
                 assert request.jwt_payload["aud"] == "me"
+
+    def test_cookie_secret(self):
+        self.env["ir.config_parameter"].set_str("database.secret", "s3cret")
+        validator = self.env["auth.jwt.validator"]
+        self.assertEqual(validator._get_jwt_cookie_secret(), "s3cret")
