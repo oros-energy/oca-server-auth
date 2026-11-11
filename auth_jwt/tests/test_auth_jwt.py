@@ -497,8 +497,8 @@ class TestAuthMethod(TransactionCase):
             }
         )
         self.addCleanup(validator.unlink)
-        self.addCleanup(auth_jwt_validator._jwks_misses.clear)
-        self.env.transaction.invalidate_ormcache()
+        auth_jwt_validator._jwks.clear()
+        self.addCleanup(auth_jwt_validator._jwks.clear)
         payload = {"aud": "me", "iss": "http://the.issuer", "exp": time.time() + 100}
 
         def token(kid):
@@ -514,3 +514,53 @@ class TestAuthMethod(TransactionCase):
             with self.assertRaises(UnauthorizedInvalidToken):
                 validator._decode(token("k3"))
             self.assertEqual(fetch.call_count, fetches)
+
+    def test_public_key_rotation(self):
+        old_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        new_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+        def jwk(key, kid):
+            return dict(
+                RSAAlgorithm.to_jwk(key.public_key(), as_dict=True),
+                kid=kid,
+                use="sig",
+                alg="RS256",
+            )
+
+        validator = self.env["auth.jwt.validator"].create(
+            {
+                "name": "rsa_rotation",
+                "signature_type": "public_key",
+                "public_key_jwk_uri": "https://issuer.invalid/rotation",
+                "public_key_algorithm": "RS256",
+                "audience": "me",
+                "issuer": "http://the.issuer",
+                "user_id_strategy": "static",
+            }
+        )
+        self.addCleanup(validator.unlink)
+        auth_jwt_validator._jwks.clear()
+        self.addCleanup(auth_jwt_validator._jwks.clear)
+        payload = {"aud": "me", "iss": "http://the.issuer", "exp": time.time() + 100}
+
+        def token(key, kid):
+            return jwt.encode(payload, key, algorithm="RS256", headers={"kid": kid})
+
+        def age_key_set(seconds):
+            uri = validator.public_key_jwk_uri
+            fetched, keys = auth_jwt_validator._jwks[uri]
+            auth_jwt_validator._jwks[uri] = (fetched - seconds, keys)
+
+        with patch.object(PyJWKClient, "fetch_data") as fetch:
+            fetch.return_value = {"keys": [jwk(old_key, "old")]}
+            validator._decode(token(old_key, "old"))
+            # The issuer adds a new key and later removes the old one.
+            fetch.return_value = {"keys": [jwk(new_key, "new")]}
+            with self.assertRaises(UnauthorizedInvalidToken):
+                validator._decode(token(new_key, "new"))
+            age_key_set(auth_jwt_validator.JWKS_MISS_INTERVAL + 1)
+            validator._decode(token(new_key, "new"))
+            validator._decode(token(new_key, "new"))
+            self.assertEqual(fetch.call_count, 2)
+            with self.assertRaises(UnauthorizedInvalidToken):
+                validator._decode(token(old_key, "old"))

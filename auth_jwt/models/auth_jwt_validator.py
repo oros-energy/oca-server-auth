@@ -30,11 +30,14 @@ _logger = logging.getLogger(__name__)
 
 AUTHORIZATION_RE = re.compile(r"^Bearer ([^ ]+)$")
 
-# A token with an unknown key id makes the validator fetch the key set again. A
-# miss blocks further fetches of that key set for this many seconds, so that tokens
-# with made up key ids cannot make every request call the identity provider.
+# Key sets per URI: (time of the fetch, {key id: key}). A key set is fetched again
+# after JWKS_MAX_AGE seconds, so a key removed at the issuer stops working. A token
+# with a key id that the key set does not hold fetches it again only when the last
+# fetch is older than JWKS_MISS_INTERVAL seconds, so that made up key ids cannot make
+# every request call the identity provider.
+JWKS_MAX_AGE = 600
 JWKS_MISS_INTERVAL = 30
-_jwks_misses = {}
+_jwks = {}
 
 
 class AuthJwtValidator(models.Model):
@@ -171,18 +174,21 @@ class AuthJwtValidator(models.Model):
             raise AmbiguousJwtValidator()
         return validator
 
-    @api.ormcache("self.public_key_jwk_uri", "kid")
     def _get_key(self, kid):
         uri = self.public_key_jwk_uri
-        missed = _jwks_misses.get(uri)
-        if missed and time.monotonic() - missed < JWKS_MISS_INTERVAL:
-            raise PyJWKClientError(f"Key set fetched recently without key id {kid!r}")
-        jwks_client = PyJWKClient(uri, cache_keys=False)
-        try:
-            return jwks_client.get_signing_key(kid).key
-        except PyJWKClientError:
-            _jwks_misses[uri] = time.monotonic()
-            raise
+        fetched, keys = _jwks.get(uri, (None, {}))
+        now = time.monotonic()
+        if (
+            fetched is None
+            or now - fetched > JWKS_MAX_AGE
+            or (kid not in keys and now - fetched > JWKS_MISS_INTERVAL)
+        ):
+            jwks_client = PyJWKClient(uri, cache_keys=False)
+            keys = {key.key_id: key.key for key in jwks_client.get_signing_keys()}
+            _jwks[uri] = (now, keys)
+        if kid not in keys:
+            raise PyJWKClientError(f"Unable to find a signing key with kid {kid!r}")
+        return keys[kid]
 
     def _encode(self, payload, secret, expire):
         """Encode and sign a JWT payload so it can be decoded and validated with
