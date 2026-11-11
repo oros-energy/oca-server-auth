@@ -3,9 +3,12 @@
 
 import contextlib
 import time
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import jwt
+from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt import PyJWKClient
+from jwt.algorithms import RSAAlgorithm
 
 import odoo.http
 from odoo.exceptions import ValidationError
@@ -22,6 +25,7 @@ from ..exceptions import (
     UnauthorizedMissingAuthorizationHeader,
     UnauthorizedPartnerNotFound,
 )
+from ..models import auth_jwt_validator
 
 
 class TestAuthMethod(TransactionCase):
@@ -463,3 +467,50 @@ class TestAuthMethod(TransactionCase):
         self.env["ir.config_parameter"].set_str("database.secret", "s3cret")
         validator = self.env["auth.jwt.validator"]
         self.assertEqual(validator._get_jwt_cookie_secret(), "s3cret")
+
+    def test_leeway(self):
+        with self._create_validator("validator") as validator:
+            token = self._create_token(exp_delta=-10)
+            with self.assertRaises(UnauthorizedInvalidToken):
+                validator._decode(token)
+            validator.leeway = 30
+            validator._decode(token)
+            token = self._create_token(nbf=time.time() + 10)
+            validator._decode(token)
+            token = self._create_token(exp_delta=-100)
+            with self.assertRaises(UnauthorizedInvalidToken):
+                validator._decode(token)
+
+    def test_public_key_unknown_kid(self):
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        jwk = RSAAlgorithm.to_jwk(private_key.public_key(), as_dict=True)
+        jwks = {"keys": [dict(jwk, kid="k1", use="sig", alg="RS256")]}
+        validator = self.env["auth.jwt.validator"].create(
+            {
+                "name": "rsa_validator",
+                "signature_type": "public_key",
+                "public_key_jwk_uri": "https://issuer.invalid/certs",
+                "public_key_algorithm": "RS256",
+                "audience": "me",
+                "issuer": "http://the.issuer",
+                "user_id_strategy": "static",
+            }
+        )
+        self.addCleanup(validator.unlink)
+        self.addCleanup(auth_jwt_validator._jwks_misses.clear)
+        self.env.transaction.invalidate_ormcache()
+        payload = {"aud": "me", "iss": "http://the.issuer", "exp": time.time() + 100}
+
+        def token(kid):
+            return jwt.encode(
+                payload, private_key, algorithm="RS256", headers={"kid": kid}
+            )
+
+        with patch.object(PyJWKClient, "fetch_data", return_value=jwks) as fetch:
+            self.assertEqual(validator._decode(token("k1"))["aud"], "me")
+            with self.assertRaises(UnauthorizedInvalidToken):
+                validator._decode(token("k2"))
+            fetches = fetch.call_count
+            with self.assertRaises(UnauthorizedInvalidToken):
+                validator._decode(token("k3"))
+            self.assertEqual(fetch.call_count, fetches)

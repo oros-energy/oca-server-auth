@@ -4,11 +4,12 @@
 import datetime
 import logging
 import re
+import time
 from calendar import timegm
 from functools import partial
 
 import jwt
-from jwt import PyJWKClient
+from jwt import PyJWKClient, PyJWKClientError
 from werkzeug.exceptions import InternalServerError
 
 from odoo import api, fields, models
@@ -28,6 +29,12 @@ from ..exceptions import (
 _logger = logging.getLogger(__name__)
 
 AUTHORIZATION_RE = re.compile(r"^Bearer ([^ ]+)$")
+
+# A token with an unknown key id makes the validator fetch the key set again. A
+# miss blocks further fetches of that key set for this many seconds, so that tokens
+# with made up key ids cannot make every request call the identity provider.
+JWKS_MISS_INTERVAL = 30
+_jwks_misses = {}
 
 
 class AuthJwtValidator(models.Model):
@@ -69,6 +76,10 @@ class AuthJwtValidator(models.Model):
         required=True, help="Comma separated list of audiences, to validate aud."
     )
     issuer = fields.Char(required=True, help="To validate iss.")
+    leeway = fields.Integer(
+        help="Seconds by which the clocks of the issuer and of Odoo may differ when"
+        " exp and nbf are checked."
+    )
     user_id_strategy = fields.Selection(
         [("static", "Static")], required=True, default="static"
     )
@@ -162,8 +173,16 @@ class AuthJwtValidator(models.Model):
 
     @api.ormcache("self.public_key_jwk_uri", "kid")
     def _get_key(self, kid):
-        jwks_client = PyJWKClient(self.public_key_jwk_uri, cache_keys=False)
-        return jwks_client.get_signing_key(kid).key
+        uri = self.public_key_jwk_uri
+        missed = _jwks_misses.get(uri)
+        if missed and time.monotonic() - missed < JWKS_MISS_INTERVAL:
+            raise PyJWKClientError(f"Key set fetched recently without key id {kid!r}")
+        jwks_client = PyJWKClient(uri, cache_keys=False)
+        try:
+            return jwks_client.get_signing_key(kid).key
+        except PyJWKClientError:
+            _jwks_misses[uri] = time.monotonic()
+            raise
 
     def _encode(self, payload, secret, expire):
         """Encode and sign a JWT payload so it can be decoded and validated with
@@ -195,13 +214,18 @@ class AuthJwtValidator(models.Model):
             except Exception as e:
                 _logger.info("Invalid token: %s", e)
                 raise UnauthorizedInvalidToken() from e
-            key = self._get_key(header.get("kid"))
+            try:
+                key = self._get_key(header.get("kid"))
+            except PyJWKClientError as e:
+                _logger.info("Invalid token: %s", e)
+                raise UnauthorizedInvalidToken() from e
             algorithm = self.public_key_algorithm
         try:
             payload = jwt.decode(
                 token,
                 key=key,
                 algorithms=[algorithm],
+                leeway=self.leeway,
                 options={
                     "require": ["exp", "aud", "iss"],
                     "verify_exp": True,

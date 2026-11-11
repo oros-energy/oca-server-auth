@@ -14,6 +14,7 @@
                         <group colspan="2" string="Token validation">
                             <field name="audience" />
                             <field name="issuer" />
+                            <field name="leeway" />
                             <field name="signature_type" />
                             <field
                                 name="secret_key"
